@@ -1,6 +1,6 @@
 """
-app.py — DocVerify Backend · NTT Data
-Flask API REST — Zero data retention
+app.py — DocVerify Backend
+Flask API REST
 Listo para deploy en Render.com
 """
 
@@ -21,9 +21,7 @@ from spellchecker import SpellChecker
 # ─────────────────────────────────────────────────
 app = Flask(__name__)
 
-# CORS: en producción reemplaza * por tu dominio de GitHub Pages
-# Ej: origins=["https://tuusuario.github.io"]
-CORS(app, origins=["*"])
+CORS(app, origins=["https://ever186.github.io/docverify/"])
 
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB máximo
 
@@ -421,7 +419,7 @@ def verificar():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "service": "DocVerify · NTT Data"})
+    return jsonify({"status": "ok", "service": "DocVerify"})
 
 
 # ─────────────────────────────────────────────────
