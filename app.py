@@ -21,7 +21,7 @@ from spellchecker import SpellChecker
 # ─────────────────────────────────────────────────
 app = Flask(__name__)
 
-CORS(app, origins=["https://ever186.github.io/docverify/"])
+CORS(app, origins=["https://ever186.github.io"])
 
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB máximo
 
