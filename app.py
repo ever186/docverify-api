@@ -49,7 +49,7 @@ def normalizar(texto: str) -> str:
 # ─────────────────────────────────────────────────
 def extraer_contenido(file_bytes: bytes) -> dict:
     """
-    Lee el .docx desde bytes en memoria — nunca toca disco.
+    Lee el .docx desde bytes en memoria
     """
     stream = io.BytesIO(file_bytes)
     doc = Document(stream)
@@ -58,7 +58,6 @@ def extraer_contenido(file_bytes: bytes) -> dict:
     metadatos = {
         "autor_meta":     (props.author or "").strip(),
         "modificado_por": (props.last_modified_by or "").strip(),
-        "creado":         str(props.created),
         "modificado":     str(props.modified),
     }
 
@@ -288,9 +287,9 @@ def verificar_autores(contenido):
 IGNORAR_PALABRAS = {
     "sanitizar","canonicalización","canonicalizar","csrf","xss","sql",
     "api","backend","frontend","payload","bypass","exploit","fuzzing",
-    "pentesting","https","http","rate","limiting","ntt","azure",
-    "aplicaciones","aplicación","autenticación","autorización","controles",
-    "control","funcionalidades","funcionalidad","vulnerabilidades","caracteres",
+    "pentesting","https","http","rate","limiting","aplicaciones","aplicación",
+    "autenticación","autorización","controles","control","funcionalidades",
+    "funcionalidad","vulnerabilidades","caracteres",
     "conclusiones","autorizados","apropiados","aquellos","corresponden",
     "deben","datos","ficheros","directo","encontradas","entreguen",
     "evaluada","incluyendo","implementar","periódica","confidencial",
