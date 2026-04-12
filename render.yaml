@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: docverify-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
+    envVars:
+      - key: FLASK_ENV
+        value: production
+    autoDeploy: true
