@@ -143,6 +143,24 @@ def verificar_parametros(contenido, titulo_p, id_tarea, consecutivo):
         else:
             resultados.append({"estado":"ERROR","detalle":f'"{titulo_p}" no encontrado en ninguna ubicación del documento'})
 
+    # ── TÍTULO EN CONCLUSIONES
+    # Buscar el título en la tabla de conclusiones (funcionalidad evaluada u otras celdas)
+    if titulo_p:
+        titulo_en_conc = False
+        try:
+            for fila in tablas[t_conc]:
+                if any(normalizar(titulo_p) in normalizar(c) for c in fila):
+                    titulo_en_conc = True
+                    break
+        except IndexError:
+            pass
+        if titulo_en_conc:
+            resultados.append({"estado":"OK",
+                               "detalle":f'"{titulo_p}" encontrado también en tabla conclusiones'})
+        else:
+            resultados.append({"estado":"WARN",
+                               "detalle":f'"{titulo_p}" NO está en tabla conclusiones — verificar campo Funcionalidad evaluada'})
+
     # ── ID TAREA
     if not id_tarea:
         resultados.append({"estado":"WARN","detalle":"No se ingresó ID de tarea"})
@@ -203,38 +221,61 @@ def extraer_fechas(texto):
 
 def verificar_fechas(contenido):
     resultados = []
-    tablas = contenido["tablas"]
-    encabezados = contenido["encabezados"]
-    hallazgos = {}
+    tablas     = contenido["tablas"]
+    encabezados= contenido["encabezados"]
+    parrafos   = contenido["parrafos"]
+    hallazgos  = {}  # { ubicacion: [fechas] }
 
+    # 1. Encabezados
     for enc in encabezados:
         for f in extraer_fechas(enc):
             hallazgos.setdefault("encabezado", []).append(f)
 
+    # 2. Historial completo — buscar en TODAS las celdas de filas 1 y 2
     for fi in [1, 2]:
         try:
-            v = tablas[2][fi][0]
-            if not es_placeholder(v) and v:
-                for f in extraer_fechas(v):
-                    hallazgos.setdefault(f"historial_fila{fi}", []).append(f)
+            for ci, v in enumerate(tablas[2][fi]):
+                if not es_placeholder(v) and v:
+                    for f in extraer_fechas(v):
+                        hallazgos.setdefault(f"historial_fila{fi}", []).append(f)
         except IndexError:
             pass
 
+    # 3. Resto de tablas (cualquier celda con fecha)
+    for ti, tabla in enumerate(tablas):
+        if ti == 2:
+            continue  # historial ya procesado
+        for fi, fila in enumerate(tabla):
+            for ci, v in enumerate(fila):
+                if not es_placeholder(v) and v:
+                    for f in extraer_fechas(v):
+                        hallazgos.setdefault(f"tabla_{ti}_fila{fi}", []).append(f)
+
+    # 4. Párrafos del cuerpo
+    for i, para in enumerate(parrafos):
+        for f in extraer_fechas(para):
+            hallazgos.setdefault(f"parrafo_{i}", []).append(f)
+
     if not hallazgos:
-        resultados.append({"estado":"WARN","detalle":"Sin fechas concretas — celdas probablemente son placeholders"})
+        resultados.append({"estado":"WARN",
+                           "detalle":"Sin fechas concretas en el documento — celdas pueden ser placeholders"})
         return resultados
 
+    # Reportar cada fecha encontrada
     todas = []
     for ubicacion, fechas in hallazgos.items():
-        for f in fechas:
+        for f in set(fechas):  # deduplicar por ubicación
             resultados.append({"estado":"INFO","detalle":f'Fecha en [{ubicacion}]: "{f}"'})
             todas.append(f)
 
+    # Coherencia global
     uniq = list(set(todas))
     if len(uniq) == 1:
-        resultados.append({"estado":"OK","detalle":f'Fechas consistentes en todo el documento: "{uniq[0]}"'})
+        resultados.append({"estado":"OK",
+                           "detalle":f'Fechas consistentes en todo el documento: "{uniq[0]}"'})
     elif len(uniq) > 1:
-        resultados.append({"estado":"ERROR","detalle":f'Fechas distintas encontradas: {uniq}'})
+        resultados.append({"estado":"ERROR",
+                           "detalle":f'Fechas INCONSISTENTES detectadas: {uniq}'})
 
     return resultados
 
