@@ -1,6 +1,6 @@
 """
 app.py — DocVerify Backend
-Flask API REST
+Flask API REST — Zero data retention
 Listo para deploy en Render.com
 """
 
@@ -21,6 +21,8 @@ from spellchecker import SpellChecker
 # ─────────────────────────────────────────────────
 app = Flask(__name__)
 
+# CORS: en producción reemplaza * por tu dominio de GitHub Pages
+# Ej: origins=["https://tuusuario.github.io"]
 CORS(app, origins=["https://ever186.github.io"])
 
 app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB máximo
@@ -49,7 +51,7 @@ def normalizar(texto: str) -> str:
 # ─────────────────────────────────────────────────
 def extraer_contenido(file_bytes: bytes) -> dict:
     """
-    Lee el .docx desde bytes en memoria
+    Lee el .docx desde bytes en memoria — nunca toca disco.
     """
     stream = io.BytesIO(file_bytes)
     doc = Document(stream)
@@ -58,6 +60,7 @@ def extraer_contenido(file_bytes: bytes) -> dict:
     metadatos = {
         "autor_meta":     (props.author or "").strip(),
         "modificado_por": (props.last_modified_by or "").strip(),
+        "creado":         str(props.created),
         "modificado":     str(props.modified),
     }
 
@@ -122,13 +125,19 @@ def verificar_parametros(contenido, titulo_p, id_tarea, consecutivo):
     else:
         titulo_norm  = normalizar(titulo_p)
         en_header    = any(titulo_norm in normalizar(e) for e in encabezados)
-        en_historial = titulo_norm in normalizar(celda(2, 1, 3))
+        # Buscar en TODA la fila — columnas varían según el documento
+        fila_hist = []
+        try:
+            fila_hist = tablas[2][1]
+        except IndexError:
+            pass
+        en_historial = any(titulo_norm in normalizar(c) for c in fila_hist)
 
         if en_header and en_historial:
             resultados.append({"estado":"OK","detalle":f'"{titulo_p}" presente en encabezado y historial'})
         elif en_header:
-            val_hist = celda(2, 1, 3)
-            resultados.append({"estado":"WARN","detalle":f'"{titulo_p}" solo en encabezado. Historial contiene: "{val_hist[:80]}"'})
+            val_hist = ' | '.join(fila_hist)
+            resultados.append({"estado":"WARN","detalle":f'"{titulo_p}" solo en encabezado. Historial contiene: "{val_hist[:100]}"'})
         elif en_historial:
             resultados.append({"estado":"WARN","detalle":f'"{titulo_p}" solo en historial, falta en encabezado'})
         else:
@@ -178,7 +187,8 @@ def verificar_parametros(contenido, titulo_p, id_tarea, consecutivo):
 # 3. FECHAS
 # ─────────────────────────────────────────────────
 PATRONES_FECHA = [
-    r'\b\d{1,2}/\d{1,2}/\d{4}\b',
+    r'\b\d{1,2}/\d{1,2}/\d{4}\b',   # DD/MM/YYYY
+    r'\b\d{4}/\d{2}/\d{2}\b',        # YYYY/MM/DD ← nuevo
     r'\b\d{1,2}-\d{1,2}-\d{4}\b',
     r'\b\d{4}-\d{2}-\d{2}\b',
     r'\b\d{1,2}\s+de\s+\w+\s+de\s+\d{4}\b',
@@ -287,9 +297,9 @@ def verificar_autores(contenido):
 IGNORAR_PALABRAS = {
     "sanitizar","canonicalización","canonicalizar","csrf","xss","sql",
     "api","backend","frontend","payload","bypass","exploit","fuzzing",
-    "pentesting","https","http","rate","limiting","aplicaciones","aplicación",
-    "autenticación","autorización","controles","control","funcionalidades",
-    "funcionalidad","vulnerabilidades","caracteres",
+    "pentesting","https","http","rate","limiting","ntt","azure",
+    "aplicaciones","aplicación","autenticación","autorización","controles",
+    "control","funcionalidades","funcionalidad","vulnerabilidades","caracteres",
     "conclusiones","autorizados","apropiados","aquellos","corresponden",
     "deben","datos","ficheros","directo","encontradas","entreguen",
     "evaluada","incluyendo","implementar","periódica","confidencial",
@@ -418,7 +428,7 @@ def verificar():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "service": "DocVerify"})
+    return jsonify({"status": "ok", "service": "DocVerify · NTT Data"})
 
 
 # ─────────────────────────────────────────────────
