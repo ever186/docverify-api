@@ -86,18 +86,55 @@ def extraer_contenido(file_bytes):
 
     parrafos = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
 
+    # Namespace de Word
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    def _texto_tc(tc):
+        """Extrae todo el texto de una celda incluyendo runs anidados."""
+        return ''.join(t.text or '' for t in tc.iter(f'{{{W}}}t')).strip()
+
+    def _leer_fila(row):
+        """
+        Lee celdas de una fila manejando:
+        - Celdas normales (w:tc)
+        - Date pickers y controles ricos (w:sdt que contienen w:tc)
+        - Celdas fusionadas (merged) — deduplica por identidad de objeto
+        """
+        celdas_raw = []
+        for child in row._tr:
+            local = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            if local == 'tc':
+                celdas_raw.append(_texto_tc(child))
+            elif local == 'sdt':
+                # Buscar w:tc dentro del sdtContent (date pickers, etc.)
+                sdt_ns = f'{{{W}}}sdtContent'
+                tc_ns  = f'{{{W}}}tc'
+                sdt_content = child.find(f'.//{sdt_ns}')
+                if sdt_content is not None:
+                    tc = sdt_content.find(f'.//{tc_ns}')
+                    if tc is not None:
+                        celdas_raw.append(_texto_tc(tc))
+                        continue
+                # Fallback: extraer texto directo del SDT
+                celdas_raw.append(''.join(t.text or '' for t in child.iter(f'{{{W}}}t')).strip())
+
+        # Deduplicar celdas horizontalmente fusionadas
+        seen_ids = []
+        celdas_unicas = []
+        for cell in row.cells:
+            cid = id(cell._tc)
+            if cid not in seen_ids:
+                seen_ids.append(cid)
+                celdas_unicas.append(cell)
+
+        # Usar la lectura SDT si tiene más columnas que la deduplicada
+        if len(celdas_raw) >= len(celdas_unicas):
+            return celdas_raw
+        return [cell.text.strip() for cell in celdas_unicas]
+
     tablas = []
     for tabla in doc.tables:
-        filas = []
-        for row in tabla.rows:
-            # Deduplicar celdas fusionadas (merged cells)
-            # python-docx repite el objeto celda para cada columna que abarca
-            seen = []
-            for cell in row.cells:
-                if cell not in seen:
-                    seen.append(cell)
-            fila = [cell.text.strip() for cell in seen]
-            filas.append(fila)
+        filas = [_leer_fila(row) for row in tabla.rows]
         tablas.append(filas)
 
     texto_completo = "\n".join(
