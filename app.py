@@ -15,8 +15,22 @@ from docx import Document
 from spellchecker import SpellChecker
 
 app = Flask(__name__)
-CORS(app, origins=["https://ever186.github.io"])
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
+CORS(app,
+    origins=["https://ever186.github.io"],
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    expose_headers=["Content-Type"],
+    max_age=600
+)
+app.config['MAX_CONTENT_LENGTH'] = 15 * 1024 * 1024  # 15 MB
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({"error": "El archivo es demasiado grande (máx 15 MB)"}), 413
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    return jsonify({"error": f"Error interno: {str(e)}"}), 500
 
 ALLOWED_EXTENSIONS = {'docx'}
 def allowed_file(f): return '.' in f and f.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -578,7 +592,7 @@ def verificar_ortografia(contenido):
 
         t = threading.Thread(target=run_spell, daemon=True)
         t.start()
-        t.join(timeout=20)
+        t.join(timeout=12)
 
         if not resultado_spell["done"] or isinstance(resultado_spell["data"], Exception):
             return {"titulo":"Ortografía","estado":"WARN","fragmento":[],
@@ -615,8 +629,12 @@ def verificar_ortografia(contenido):
 # ─────────────────────────────────────────────
 # ENDPOINT PRINCIPAL
 # ─────────────────────────────────────────────
-@app.route('/verificar', methods=['POST'])
+@app.route('/verificar', methods=['POST', 'OPTIONS'])
 def verificar():
+    # Responder preflight CORS
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
     if 'file' not in request.files:
         return jsonify({"error": "No se recibió ningún archivo"}), 400
 
