@@ -90,7 +90,13 @@ def extraer_contenido(file_bytes):
     for tabla in doc.tables:
         filas = []
         for row in tabla.rows:
-            fila = [cell.text.strip() for cell in row.cells]
+            # Deduplicar celdas fusionadas (merged cells)
+            # python-docx repite el objeto celda para cada columna que abarca
+            seen = []
+            for cell in row.cells:
+                if cell not in seen:
+                    seen.append(cell)
+            fila = [cell.text.strip() for cell in seen]
             filas.append(fila)
         tablas.append(filas)
 
