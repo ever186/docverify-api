@@ -1,75 +1,88 @@
 """
-app.py — DocVerify Backend
+app.py — Verificador de coherencia .docx
 Flask API REST — Zero data retention
-Listo para deploy en Render.com
 """
 
 import os
 import re
 import io
 import signal
-import tempfile
-from datetime import datetime
+import threading
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from docx import Document
 from spellchecker import SpellChecker
 
-# ─────────────────────────────────────────────────
-# FLASK SETUP
-# ─────────────────────────────────────────────────
 app = Flask(__name__)
-
-# CORS: en producción reemplaza * por tu dominio de GitHub Pages
-# Ej: origins=["https://tuusuario.github.io"]
 CORS(app, origins=["https://ever186.github.io"])
-
-app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10 MB máximo
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
 
 ALLOWED_EXTENSIONS = {'docx'}
+def allowed_file(f): return '.' in f and f.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-# ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # HELPERS
-# ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 PLACEHOLDER = re.compile(r'^<[^>]+>$')
+def es_placeholder(v): return bool(PLACEHOLDER.match(v.strip()))
 
-def es_placeholder(val: str) -> bool:
-    return bool(PLACEHOLDER.match(val.strip()))
+def normalizar(t):
+    return t.lower().replace('\u2013','-').replace('\u2014','-').strip()
 
-def normalizar(texto: str) -> str:
-    """Normaliza guiones Unicode y espacios para comparación robusta."""
-    return texto.lower().replace('\u2013', '-').replace('\u2014', '-').strip()
+PATRONES_FECHA = [
+    r'\b\d{1,2}/\d{1,2}/\d{4}\b',
+    r'\b\d{4}/\d{2}/\d{2}\b',
+    r'\b\d{1,2}-\d{1,2}-\d{4}\b',
+    r'\b\d{4}-\d{2}-\d{2}\b',
+    r'\b\d{1,2}\s+de\s+\w+\s+de\s+\d{4}\b',
+    r'\b\d{1,2}\s+\w+\s+\d{4}\b',
+]
 
+def extraer_fechas(texto):
+    fechas = []
+    for p in PATRONES_FECHA:
+        fechas += re.findall(p, texto, re.IGNORECASE)
+    fechas = [f for f in fechas if not re.match(r'^\d{1,2}\.\d{1,2}$', f)]
+    return list(set(fechas))
 
-# ─────────────────────────────────────────────────
-# 1. EXTRACCIÓN
-# ─────────────────────────────────────────────────
-def extraer_contenido(file_bytes: bytes) -> dict:
-    """
-    Lee el .docx desde bytes en memoria — nunca toca disco.
-    """
-    stream = io.BytesIO(file_bytes)
-    doc = Document(stream)
+def idx_conclusiones(tablas):
+    for i, tabla in enumerate(tablas):
+        for fila in tabla:
+            for c in fila:
+                if 'id azure' in c.lower() or ('consecutivo' in c.lower() and 'consecutivo' != c.lower()):
+                    return i
+    # fallback: buscar tabla con campo "consecutivo"
+    for i, tabla in enumerate(tablas):
+        for fila in tabla:
+            if any(c.lower() == 'consecutivo' for c in fila):
+                return i
+    return -1
+
+def celda_safe(tablas, t, f, c):
+    try: return tablas[t][f][c].strip()
+    except: return ""
+
+# ─────────────────────────────────────────────
+# EXTRACCIÓN
+# ─────────────────────────────────────────────
+def extraer_contenido(file_bytes):
+    doc = Document(io.BytesIO(file_bytes))
     props = doc.core_properties
 
     metadatos = {
         "autor_meta":     (props.author or "").strip(),
         "modificado_por": (props.last_modified_by or "").strip(),
-        "creado":         str(props.created),
-        "modificado":     str(props.modified),
     }
 
     encabezados = []
     for section in doc.sections:
+        vistos = set()
         for para in section.header.paragraphs:
             t = para.text.strip()
-            if t:
+            if t and t not in vistos:
                 encabezados.append(t)
+                vistos.add(t)
 
     parrafos = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
 
@@ -94,277 +107,399 @@ def extraer_contenido(file_bytes: bytes) -> dict:
         "texto_completo": texto_completo,
     }
 
-
-# ─────────────────────────────────────────────────
-# 2. PARÁMETROS
-# ─────────────────────────────────────────────────
-def verificar_parametros(contenido, titulo_p, id_tarea, consecutivo):
-    resultados = []
-    tablas = contenido["tablas"]
+# ─────────────────────────────────────────────
+# SECCIÓN 1 — ENCABEZADO
+# ─────────────────────────────────────────────
+def seccion_encabezado(contenido, titulo_p):
+    """Muestra el encabezado completo y valida el título."""
     encabezados = contenido["encabezados"]
+    validaciones = []
+    fragmento = []
 
-    def celda(t, f, c):
-        try:
-            return tablas[t][f][c].strip()
-        except IndexError:
-            return ""
+    for enc in encabezados:
+        fragmento.append(enc)
 
-    def idx_conclusiones(tablas):
-        for i, tabla in enumerate(tablas):
-            for fila in tabla:
-                for celda_val in fila:
-                    if "id azure" in celda_val.lower() or "consecutivo" in celda_val.lower():
-                        return i
-        return 4
+    # Validar título en encabezado
+    if titulo_p:
+        en_header = any(normalizar(titulo_p) in normalizar(e) for e in encabezados)
+        if en_header:
+            validaciones.append({"estado":"OK","detalle":f'Título "{titulo_p}" ✔ presente en encabezado'})
+        else:
+            validaciones.append({"estado":"ERROR","detalle":f'Título "{titulo_p}" ✘ NO encontrado en encabezado'})
 
+    # Validar fechas en encabezado
+    fechas_header = []
+    for enc in encabezados:
+        fechas_header += extraer_fechas(enc)
+    if fechas_header:
+        validaciones.append({"estado":"INFO","detalle":f'Fecha en encabezado: {list(set(fechas_header))}'})
+    else:
+        validaciones.append({"estado":"WARN","detalle":"Sin fecha concreta en encabezado (puede ser placeholder)"})
+
+    estado_general = "ERROR" if any(v["estado"]=="ERROR" for v in validaciones) else \
+                     "WARN"  if any(v["estado"]=="WARN"  for v in validaciones) else "OK"
+
+    return {
+        "titulo":      "Encabezado del documento",
+        "estado":      estado_general,
+        "fragmento":   fragmento,
+        "validaciones": validaciones,
+    }
+
+# ─────────────────────────────────────────────
+# SECCIÓN 2 — INFORMACIÓN DEL DOCUMENTO
+# ─────────────────────────────────────────────
+def seccion_info_documento(contenido, consecutivo):
+    """Muestra la tabla de información completa y valida consecutivo y autor."""
+    tablas    = contenido["tablas"]
+    metadatos = contenido["metadatos"]
+    validaciones = []
+    fragmento = []   # lista de {campo, valor, estado}
+
+    try:
+        tabla_info = tablas[1]
+    except IndexError:
+        return {"titulo":"Información del documento","estado":"WARN",
+                "fragmento":[],"validaciones":[{"estado":"WARN","detalle":"Tabla de información no encontrada"}]}
+
+    # Construir fragmento visual con TODAS las filas de la tabla
+    campos_importantes = {}
+    for fila in tabla_info:
+        if len(fila) >= 2:
+            campo = fila[0].rstrip(':').strip()
+            valor = fila[1].strip()
+        elif len(fila) == 1:
+            campo = fila[0].rstrip(':').strip()
+            valor = ""
+        else:
+            continue
+
+        es_ph = es_placeholder(valor) if valor else False
+        fragmento.append({
+            "campo": campo,
+            "valor": valor if valor else "—",
+            "es_placeholder": es_ph
+        })
+        campos_importantes[campo.lower()] = valor
+
+    # Validar consecutivo
+    if consecutivo:
+        val_cod = campos_importantes.get("código", "") or campos_importantes.get("codigo", "")
+        if normalizar(consecutivo) in normalizar(val_cod):
+            validaciones.append({"estado":"OK","detalle":f'Consecutivo "{consecutivo}" ✔ coincide con Código'})
+        elif es_placeholder(val_cod):
+            validaciones.append({"estado":"WARN","detalle":f'Código aún es placeholder: "{val_cod}"'})
+        else:
+            validaciones.append({"estado":"ERROR","detalle":f'Consecutivo "{consecutivo}" ✘ no coincide — Código contiene: "{val_cod}"'})
+
+    # Validar autor vs metadatos
+    autor_doc = campos_importantes.get("autor", "")
+    meta_autor = metadatos["autor_meta"]
+    meta_mod   = metadatos["modificado_por"]
+
+    if autor_doc and not es_placeholder(autor_doc):
+        validaciones.append({"estado":"INFO","detalle":f'Autor en metadatos del archivo: "{meta_autor}"'})
+        validaciones.append({"estado":"INFO","detalle":f'Última modificación por: "{meta_mod}"'})
+        coincide = meta_autor and (meta_autor.lower() in autor_doc.lower() or autor_doc.lower() in meta_autor.lower())
+        if coincide:
+            validaciones.append({"estado":"OK","detalle":f'Autor "{autor_doc}" ✔ coincide con metadatos del archivo'})
+        else:
+            validaciones.append({"estado":"WARN","detalle":f'Autor "{autor_doc}" ≠ metadato del archivo "{meta_autor}" — verificar si es intencional'})
+    else:
+        validaciones.append({"estado":"WARN","detalle":"Campo Autor es placeholder o está vacío"})
+
+    estado_general = "ERROR" if any(v["estado"]=="ERROR" for v in validaciones) else \
+                     "WARN"  if any(v["estado"]=="WARN"  for v in validaciones) else "OK"
+
+    return {
+        "titulo":       "Información del documento",
+        "estado":       estado_general,
+        "fragmento":    fragmento,
+        "validaciones": validaciones,
+        "tipo":         "tabla_info",
+    }
+
+# ─────────────────────────────────────────────
+# SECCIÓN 3 — HISTORIAL DE REVISIONES
+# ─────────────────────────────────────────────
+def seccion_historial(contenido, titulo_p):
+    """Muestra el historial completo y valida título, fechas y autor."""
+    tablas = contenido["tablas"]
+    validaciones = []
+    fragmento = []
+
+    try:
+        tabla_hist = tablas[2]
+    except IndexError:
+        return {"titulo":"Historial de revisiones","estado":"WARN",
+                "fragmento":[],"validaciones":[{"estado":"WARN","detalle":"Historial no encontrado"}]}
+
+    # Encabezado del historial
+    if tabla_hist:
+        encabezado_hist = tabla_hist[0]
+        filas_data      = tabla_hist[1:]
+    else:
+        return {"titulo":"Historial de revisiones","estado":"WARN",
+                "fragmento":[],"validaciones":[{"estado":"WARN","detalle":"Historial vacío"}]}
+
+    fragmento = {
+        "encabezados": encabezado_hist,
+        "filas":       filas_data
+    }
+
+    # ── Validar título en historial
+    if titulo_p:
+        titulo_norm = normalizar(titulo_p)
+        en_hist = any(titulo_norm in normalizar(c) for fila in filas_data for c in fila)
+        if en_hist:
+            validaciones.append({"estado":"OK","detalle":f'Título "{titulo_p}" ✔ presente en historial'})
+        else:
+            validaciones.append({"estado":"ERROR","detalle":f'Título "{titulo_p}" ✘ NO encontrado en historial'})
+
+    # ── Validar fechas en historial
+    fechas_hist = []
+    for fila in filas_data:
+        for celda in fila:
+            if not es_placeholder(celda):
+                fechas_hist += extraer_fechas(celda)
+    fechas_hist = list(set(fechas_hist))
+
+    if fechas_hist:
+        if len(fechas_hist) == 1:
+            validaciones.append({"estado":"OK","detalle":f'Fechas en historial coherentes: "{fechas_hist[0]}"'})
+        else:
+            validaciones.append({"estado":"ERROR","detalle":f'Fechas inconsistentes en historial: {fechas_hist}'})
+    else:
+        validaciones.append({"estado":"WARN","detalle":"Sin fechas concretas en historial (placeholders o celdas fusionadas)"})
+
+    # ── Validar coherencia de autores en historial
+    autores_hist = []
+    for fila in filas_data:
+        if fila:
+            ultimo = fila[-1]
+            if ultimo and not es_placeholder(ultimo) and len(ultimo) > 3:
+                autores_hist.append(ultimo)
+    autores_uniq = list(set(autores_hist))
+
+    if len(autores_uniq) == 1:
+        validaciones.append({"estado":"OK","detalle":f'Autor coherente en historial: "{autores_uniq[0]}"'})
+    elif len(autores_uniq) > 1:
+        validaciones.append({"estado":"ERROR","detalle":f'Autores inconsistentes en historial: {autores_uniq}'})
+    else:
+        validaciones.append({"estado":"WARN","detalle":"Autores en historial son placeholders"})
+
+    estado_general = "ERROR" if any(v["estado"]=="ERROR" for v in validaciones) else \
+                     "WARN"  if any(v["estado"]=="WARN"  for v in validaciones) else "OK"
+
+    return {
+        "titulo":       "Historial de revisiones",
+        "estado":       estado_general,
+        "fragmento":    fragmento,
+        "validaciones": validaciones,
+        "tipo":         "tabla_historial",
+    }
+
+# ─────────────────────────────────────────────
+# SECCIÓN 4 — CONCLUSIONES
+# ─────────────────────────────────────────────
+def seccion_conclusiones(contenido, titulo_p, id_tarea, consecutivo):
+    """Muestra la tabla de conclusiones completa + párrafo y valida todos los campos."""
+    tablas   = contenido["tablas"]
+    parrafos = contenido["parrafos"]
+    validaciones = []
     t_conc = idx_conclusiones(tablas)
 
-    # ── TÍTULO
-    if not titulo_p:
-        resultados.append({"estado":"WARN","detalle":"No se ingresó título"})
-    else:
-        titulo_norm  = normalizar(titulo_p)
-        en_header    = any(titulo_norm in normalizar(e) for e in encabezados)
-        # Buscar en TODA la fila — columnas varían según el documento
-        fila_hist = []
+    # ── Párrafo de conclusiones (contexto textual)
+    parrafo_conc = ""
+    for para in parrafos:
+        if "corresponden a la aplicación" in para.lower() or "resultados obtenidos" in para.lower():
+            parrafo_conc = para
+            break
+
+    # ── Tabla conclusiones
+    tabla_conc_data = []
+    if t_conc >= 0:
         try:
-            fila_hist = tablas[2][1]
+            tabla_conc_data = tablas[t_conc]
         except IndexError:
             pass
-        en_historial = any(titulo_norm in normalizar(c) for c in fila_hist)
 
-        if en_header and en_historial:
-            resultados.append({"estado":"OK","detalle":f'"{titulo_p}" presente en encabezado y historial'})
-        elif en_header:
-            val_hist = ' | '.join(fila_hist)
-            resultados.append({"estado":"WARN","detalle":f'"{titulo_p}" solo en encabezado. Historial contiene: "{val_hist[:100]}"'})
-        elif en_historial:
-            resultados.append({"estado":"WARN","detalle":f'"{titulo_p}" solo en historial, falta en encabezado'})
-        else:
-            resultados.append({"estado":"ERROR","detalle":f'"{titulo_p}" no encontrado en ninguna ubicación del documento'})
+    fragmento = {
+        "parrafo":       parrafo_conc,
+        "tabla_campos":  []
+    }
 
-    # ── TÍTULO EN CONCLUSIONES
-    # Buscar el título en la tabla de conclusiones (funcionalidad evaluada u otras celdas)
+    # Construir vista de la tabla de conclusiones
+    valores_conc = {}
+    if tabla_conc_data:
+        for fila in tabla_conc_data[1:]:  # skip header
+            if len(fila) >= 2:
+                campo = fila[0].strip()
+                valor = fila[1].strip()
+                es_ph = es_placeholder(valor) if valor else False
+                fragmento["tabla_campos"].append({
+                    "campo": campo,
+                    "valor": valor if valor else "—",
+                    "es_placeholder": es_ph
+                })
+                valores_conc[campo.lower()] = valor
+
+    # ── Validar título en párrafo de conclusiones
     if titulo_p:
-        titulo_en_conc = False
-        try:
-            for fila in tablas[t_conc]:
-                if any(normalizar(titulo_p) in normalizar(c) for c in fila):
-                    titulo_en_conc = True
-                    break
-        except IndexError:
-            pass
-        if titulo_en_conc:
-            resultados.append({"estado":"OK",
-                               "detalle":f'"{titulo_p}" encontrado también en tabla conclusiones'})
+        titulo_norm = normalizar(titulo_p)
+        en_parrafo = any(titulo_norm in normalizar(p) for p in parrafos)
+        en_tabla   = any(titulo_norm in normalizar(c) for fila in tabla_conc_data for c in fila)
+        if en_parrafo or en_tabla:
+            validaciones.append({"estado":"OK","detalle":f'Título "{titulo_p}" ✔ presente en sección Conclusiones'})
         else:
-            resultados.append({"estado":"WARN",
-                               "detalle":f'"{titulo_p}" NO está en tabla conclusiones — verificar campo Funcionalidad evaluada'})
+            validaciones.append({"estado":"WARN","detalle":f'Título "{titulo_p}" ✘ NO aparece en Conclusiones — revisar párrafo introductorio'})
 
-    # ── ID TAREA
-    if not id_tarea:
-        resultados.append({"estado":"WARN","detalle":"No se ingresó ID de tarea"})
-    else:
-        v = celda(t_conc, 1, 1)
-        if normalizar(id_tarea) in normalizar(v):
-            resultados.append({"estado":"OK","detalle":f'"{id_tarea}" encontrado en tabla conclusiones (ID Azure)'})
-        elif es_placeholder(v):
-            resultados.append({"estado":"WARN","detalle":f'Celda ID Azure es placeholder "{v}", no "{id_tarea}"'})
-        elif v == "":
-            resultados.append({"estado":"ERROR","detalle":"Celda ID Azure vacía — revisar estructura del documento"})
+    # ── Validar ID Azure
+    if id_tarea:
+        val_id = valores_conc.get("id azure", "")
+        if normalizar(id_tarea) in normalizar(val_id):
+            validaciones.append({"estado":"OK","detalle":f'ID Azure "{id_tarea}" ✔ coincide'})
+        elif es_placeholder(val_id):
+            validaciones.append({"estado":"WARN","detalle":f'ID Azure aún es placeholder: "{val_id}"'})
+        elif val_id == "":
+            validaciones.append({"estado":"ERROR","detalle":"Celda ID Azure vacía"})
         else:
-            resultados.append({"estado":"ERROR","detalle":f'Se esperaba "{id_tarea}", se encontró "{v}"'})
+            validaciones.append({"estado":"ERROR","detalle":f'ID Azure esperado "{id_tarea}" ✘ no coincide — contiene: "{val_id}"'})
 
-    # ── CONSECUTIVO
-    if not consecutivo:
-        resultados.append({"estado":"WARN","detalle":"No se ingresó consecutivo"})
-    else:
-        v1 = celda(1, 0, 1)
-        v2 = celda(t_conc, 2, 1)
-        encontrado_en, placeholder_en = [], []
-
-        for v, etq in [(v1, "tabla_info→Código"), (v2, "tabla_conclusiones→Consecutivo")]:
-            if normalizar(consecutivo) in normalizar(v):
-                encontrado_en.append(etq)
-            elif es_placeholder(v):
-                placeholder_en.append(etq)
-
-        if len(encontrado_en) == 2:
-            resultados.append({"estado":"OK","detalle":f'"{consecutivo}" coherente en tabla_info y tabla_conclusiones'})
-        elif len(encontrado_en) == 1:
-            resultados.append({"estado":"WARN","detalle":f'"{consecutivo}" solo encontrado en {encontrado_en[0]}'})
-        elif placeholder_en:
-            resultados.append({"estado":"WARN","detalle":f'Celdas de consecutivo sin rellenar: {placeholder_en}'})
+    # ── Validar consecutivo en conclusiones
+    if consecutivo:
+        val_consec = valores_conc.get("consecutivo", "")
+        if normalizar(consecutivo) in normalizar(val_consec):
+            validaciones.append({"estado":"OK","detalle":f'Consecutivo "{consecutivo}" ✔ coincide en conclusiones'})
+        elif es_placeholder(val_consec):
+            validaciones.append({"estado":"WARN","detalle":f'Consecutivo en conclusiones es placeholder: "{val_consec}"'})
         else:
-            resultados.append({"estado":"ERROR","detalle":f'"{consecutivo}" no coincide. tabla_info="{v1}", conclusiones="{v2}"'})
+            validaciones.append({"estado":"ERROR","detalle":f'Consecutivo esperado "{consecutivo}" ✘ no coincide — contiene: "{val_consec}"'})
 
-    return resultados
+    # ── Mostrar resultado y observaciones como info
+    resultado = valores_conc.get("resultado", "")
+    if resultado and not es_placeholder(resultado):
+        estado_res = "OK" if resultado.upper() == "CERTIFICADA" else "WARN"
+        validaciones.append({"estado":estado_res,"detalle":f'Resultado de la prueba: "{resultado}"'})
 
+    estado_general = "ERROR" if any(v["estado"]=="ERROR" for v in validaciones) else \
+                     "WARN"  if any(v["estado"]=="WARN"  for v in validaciones) else "OK"
 
-# ─────────────────────────────────────────────────
-# 3. FECHAS
-# ─────────────────────────────────────────────────
-PATRONES_FECHA = [
-    r'\b\d{1,2}/\d{1,2}/\d{4}\b',   # DD/MM/YYYY
-    r'\b\d{4}/\d{2}/\d{2}\b',        # YYYY/MM/DD ← nuevo
-    r'\b\d{1,2}-\d{1,2}-\d{4}\b',
-    r'\b\d{4}-\d{2}-\d{2}\b',
-    r'\b\d{1,2}\s+de\s+\w+\s+de\s+\d{4}\b',
-    r'\b\d{1,2}\s+\w+\s+\d{4}\b',
-]
+    return {
+        "titulo":       "Conclusiones",
+        "estado":       estado_general,
+        "fragmento":    fragmento,
+        "validaciones": validaciones,
+        "tipo":         "conclusiones",
+    }
 
-def extraer_fechas(texto):
-    fechas = []
-    for p in PATRONES_FECHA:
-        fechas += re.findall(p, texto, re.IGNORECASE)
-    return list(set(fechas))
-
-def verificar_fechas(contenido):
-    resultados = []
+# ─────────────────────────────────────────────
+# SECCIÓN 5 — COHERENCIA GLOBAL DE FECHAS
+# ─────────────────────────────────────────────
+def seccion_fechas(contenido):
+    """Reúne TODAS las fechas del documento y verifica que sean coherentes."""
     tablas     = contenido["tablas"]
     encabezados= contenido["encabezados"]
     parrafos   = contenido["parrafos"]
-    hallazgos  = {}  # { ubicacion: [fechas] }
+    validaciones = []
+    hallazgos  = {}  # { descripcion_ubicacion: fecha }
 
-    # 1. Encabezados
+    # Encabezados
     for enc in encabezados:
         for f in extraer_fechas(enc):
-            hallazgos.setdefault("encabezado", []).append(f)
+            hallazgos[f"Encabezado — {enc[:50]}"] = f
 
-    # 2. Historial completo — buscar en TODAS las celdas de filas 1 y 2
-    for fi in [1, 2]:
-        try:
+    # Historial — todas las celdas
+    try:
+        for fi in [1, 2]:
             for ci, v in enumerate(tablas[2][fi]):
                 if not es_placeholder(v) and v:
                     for f in extraer_fechas(v):
-                        hallazgos.setdefault(f"historial_fila{fi}", []).append(f)
-        except IndexError:
-            pass
+                        hallazgos[f"Historial fila {fi} — {v[:40]}"] = f
+    except (IndexError, KeyError):
+        pass
 
-    # 3. Resto de tablas (cualquier celda con fecha)
+    # Resto de tablas
     for ti, tabla in enumerate(tablas):
-        if ti == 2:
-            continue  # historial ya procesado
+        if ti == 2: continue
         for fi, fila in enumerate(tabla):
             for ci, v in enumerate(fila):
                 if not es_placeholder(v) and v:
                     for f in extraer_fechas(v):
-                        hallazgos.setdefault(f"tabla_{ti}_fila{fi}", []).append(f)
+                        nombre_campo = tablas[ti][0][ci] if fi > 0 and tablas[ti] and ci < len(tablas[ti][0]) else f"col{ci}"
+                        hallazgos[f"Tabla {ti}, {nombre_campo} — {v[:30]}"] = f
 
-    # 4. Párrafos del cuerpo
+    # Párrafos
     for i, para in enumerate(parrafos):
         for f in extraer_fechas(para):
-            hallazgos.setdefault(f"parrafo_{i}", []).append(f)
+            hallazgos[f"Párrafo — {para[:50]}"] = f
+
+    fragmento = [{"ubicacion": ub, "fecha": f} for ub, f in hallazgos.items()]
 
     if not hallazgos:
-        resultados.append({"estado":"WARN",
-                           "detalle":"Sin fechas concretas en el documento — celdas pueden ser placeholders"})
-        return resultados
+        return {
+            "titulo":       "Coherencia de fechas",
+            "estado":       "WARN",
+            "fragmento":    [],
+            "validaciones": [{"estado":"WARN","detalle":"Sin fechas concretas en el documento — todos los campos de fecha son placeholders"}],
+        }
 
-    # Reportar cada fecha encontrada
-    todas = []
-    for ubicacion, fechas in hallazgos.items():
-        for f in set(fechas):  # deduplicar por ubicación
-            resultados.append({"estado":"INFO","detalle":f'Fecha en [{ubicacion}]: "{f}"'})
-            todas.append(f)
+    todas = list(hallazgos.values())
+    uniq  = list(set(todas))
 
-    # Coherencia global
-    uniq = list(set(todas))
     if len(uniq) == 1:
-        resultados.append({"estado":"OK",
-                           "detalle":f'Fechas consistentes en todo el documento: "{uniq[0]}"'})
-    elif len(uniq) > 1:
-        resultados.append({"estado":"ERROR",
-                           "detalle":f'Fechas INCONSISTENTES detectadas: {uniq}'})
-
-    return resultados
-
-
-# ─────────────────────────────────────────────────
-# 4. AUTORES
-# ─────────────────────────────────────────────────
-def verificar_autores(contenido):
-    resultados = []
-    tablas = contenido["tablas"]
-    meta_autor = contenido["metadatos"]["autor_meta"]
-    meta_mod   = contenido["metadatos"]["modificado_por"]
-
-    resultados.append({"estado":"INFO","detalle":f'Autor en metadatos del archivo: "{meta_autor}"'})
-    resultados.append({"estado":"INFO","detalle":f'Modificado por (metadatos): "{meta_mod}"'})
-
-    ubicaciones = [
-        (1, 1, 1, "tabla_info→Autor"),
-        (2, 1, 4, "historial→fila1→Autor"),
-        (2, 2, 4, "historial→fila2→Autor"),
-    ]
-
-    autores_doc = {}
-    for t_i, f_i, c_i, etq in ubicaciones:
-        try:
-            v = tablas[t_i][f_i][c_i].strip()
-            if v and not es_placeholder(v):
-                autores_doc[etq] = v
-                resultados.append({"estado":"INFO","detalle":f'Autor en [{etq}]: "{v}"'})
-            elif es_placeholder(v):
-                resultados.append({"estado":"WARN","detalle":f'[{etq}] es placeholder sin rellenar: "{v}"'})
-        except IndexError:
-            pass
-
-    if not autores_doc:
-        resultados.append({"estado":"WARN","detalle":"Todas las celdas de autor son placeholders"})
-        return resultados
-
-    valores = list(set(autores_doc.values()))
-    if len(valores) == 1:
-        resultados.append({"estado":"OK","detalle":f'Autor consistente en todo el documento: "{valores[0]}"'})
+        validaciones.append({"estado":"OK","detalle":f'Todas las fechas son coherentes: "{uniq[0]}"'})
     else:
-        resultados.append({"estado":"ERROR","detalle":f'Autores inconsistentes en el documento: {valores}'})
+        validaciones.append({"estado":"ERROR","detalle":f'Fechas inconsistentes detectadas: {uniq}'})
+        for ub, f in hallazgos.items():
+            validaciones.append({"estado":"INFO","detalle":f'"{f}" en {ub}'})
 
-    for val in valores:
-        coincide = meta_autor and (
-            meta_autor.lower() in val.lower() or val.lower() in meta_autor.lower()
-        )
-        if meta_autor and not coincide:
-            resultados.append({"estado":"WARN","detalle":f'Autor del documento "{val}" difiere del metadato del archivo "{meta_autor}"'})
-        elif meta_autor and coincide:
-            resultados.append({"estado":"OK","detalle":f'"{val}" coincide con metadatos del archivo'})
+    estado_general = "ERROR" if any(v["estado"]=="ERROR" for v in validaciones) else \
+                     "WARN"  if any(v["estado"]=="WARN"  for v in validaciones) else "OK"
 
-    return resultados
+    return {
+        "titulo":       "Coherencia de fechas",
+        "estado":       estado_general,
+        "fragmento":    fragmento,
+        "validaciones": validaciones,
+        "tipo":         "fechas",
+    }
 
-
-# ─────────────────────────────────────────────────
-# 5. ORTOGRAFÍA
-# ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# SECCIÓN 6 — ORTOGRAFÍA
+# ─────────────────────────────────────────────
 IGNORAR_PALABRAS = {
-    "sanitizar","canonicalización","canonicalizar","csrf","xss","sql",
-    "api","backend","frontend","payload","bypass","exploit","fuzzing",
-    "pentesting","https","http","rate","limiting","ntt","azure",
-    "aplicaciones","aplicación","autenticación","autorización","controles",
-    "control","funcionalidades","funcionalidad","vulnerabilidades","caracteres",
-    "conclusiones","autorizados","apropiados","aquellos","corresponden",
-    "deben","datos","ficheros","directo","encontradas","entreguen",
-    "evaluada","incluyendo","implementar","periódica","confidencial",
-    "infraestructura","telecomunicaciones","informática","módulos",
-    "resultados","solicitaron","distribución","codificar","contextualmente",
-    "directamente","publicación","suministrado","específicamente",
-    "provista","ninguna","provisto","subversión","versión","sección",
-    "también","través","según","módulo","opción","opciones",
-    "deberán","tendrán","están","básicamente","acceso",
-    "usuario","usuarios","servidor","servidores","sistema","sistemas",
-    "seguridad","prueba","pruebas","informe","informes","semestral",
-    "documentación","actualización","revisión","creación","generación",
-    "aprobación","modificación","versiones","fecha","registro","registros",
-    "información","gerencia","dirección","recomendaciones","implementación",
-    "validación","verificación","proteger","enviar","exigir","perfilar",
-    "restringir","asignar","utilizar","implementando","modificaciones",
-    "observaciones","obtenidos","realizadas","relacionadas","revisiones",
-    "meses","necesarios","otros","pasados","privilegios","recursos",
-    "salidas","sesiones","siguientes","todas","valores","áreas","tarea",
+    # técnico seguridad
+    "sanitizar","canonicalización","csrf","xss","sql","api","backend","frontend",
+    "payload","bypass","exploit","fuzzing","pentesting","apikey","endpoint",
+    "endpoints","token","tokens","bearer","oauth","jwt","https","http","cors",
+    "json","xml","rest","soap","curl","headers","header","response","request",
+    "client","server","proxy","timeout","redirect","cookie","cookies","script",
+    "injection","buffer","overflow","encoding","hashing","hash","hmac","rsa",
+    # inglés técnico común
+    "access","application","applicant","mobile","cloud","devops","pipeline",
+    # español formal que pyspellchecker falla
+    "aplicaciones","autenticación","autorización","controles","funcionalidades",
+    "vulnerabilidades","caracteres","conclusiones","autorizados","apropiados",
+    "corresponden","ficheros","evaluada","incluyendo","periódica","confidencial",
+    "telecomunicaciones","informática","módulos","distribución","codificar",
+    "subversión","versión","sección","también","través","según","opciones",
+    "deberán","tendrán","están","acceso","usuarios","servidores","sistemas",
+    "seguridad","informe","documentación","actualización","revisión","creación",
+    "generación","aprobación","modificación","versiones","registros","información",
+    "gerencia","dirección","recomendaciones","implementación","validación",
+    "implementando","modificaciones","observaciones","obtenidos","realizadas",
+    "relacionadas","revisiones","necesarios","privilegios","recursos","salidas",
+    "sesiones","siguientes","áreas","adicionalmente","aceptando","accesibles",
+    "ambientes","amplifica","amplía","aparece","aislados","credenciales",
+    "canales","clientes","críticas","debidas","derivados","activación","activos",
+    # hashes y IDs — ignorar todo lo que parece hex
 }
 
-def verificar_ortografia(contenido):
-    resultados = []
+def es_hex_o_id(palabra):
+    return bool(re.match(r'^[0-9a-f]{4,}$', palabra))
 
+def verificar_ortografia(contenido):
     texto = contenido["texto_completo"]
     texto = re.sub(r'<[^>]+>', ' ', texto)
     texto = re.sub(r'https?://\S+', ' ', texto)
@@ -374,108 +509,113 @@ def verificar_ortografia(contenido):
     texto = re.sub(r'\s+', ' ', texto).strip()
 
     palabras = [p.lower() for p in texto.split() if len(p) > 3]
-    palabras_a_revisar = [p for p in set(palabras) if p not in IGNORAR_PALABRAS]
+    palabras_revisar = [
+        p for p in set(palabras)
+        if p not in IGNORAR_PALABRAS and not es_hex_o_id(p) and len(p) > 3
+    ]
 
-    if not palabras_a_revisar:
-        resultados.append({"estado":"OK","detalle":"Sin errores ortográficos detectados"})
-        return resultados
+    if not palabras_revisar:
+        return {"titulo":"Ortografía","estado":"OK","fragmento":[],
+                "validaciones":[{"estado":"OK","detalle":"Sin errores ortográficos detectados"}],
+                "tipo":"ortografia"}
 
+    sugerencias = []
     try:
-        def timeout_handler(sig, frame):
-            raise TimeoutError()
+        resultado_spell = {"data": None, "done": False}
+        def run_spell():
+            try:
+                spell = SpellChecker(language='es')
+                desc  = spell.unknown(palabras_revisar)
+                errores = [p for p in desc if p not in IGNORAR_PALABRAS and not es_hex_o_id(p)]
+                resultado_spell["data"] = (spell, errores)
+            except Exception as ex:
+                resultado_spell["data"] = ex
+            finally:
+                resultado_spell["done"] = True
 
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(15)
+        t = threading.Thread(target=run_spell, daemon=True)
+        t.start()
+        t.join(timeout=20)
 
-        spell = SpellChecker(language='es')
-        desconocidas = spell.unknown(palabras_a_revisar)
-        errores = [p for p in desconocidas if p not in IGNORAR_PALABRAS]
+        if not resultado_spell["done"] or isinstance(resultado_spell["data"], Exception):
+            return {"titulo":"Ortografía","estado":"WARN","fragmento":[],
+                    "validaciones":[{"estado":"WARN","detalle":"Revisión ortográfica omitida por timeout"}],
+                    "tipo":"ortografia"}
 
-        signal.alarm(0)
+        spell, errores = resultado_spell["data"]
+        for palabra in sorted(errores)[:25]:
+            sug = spell.correction(palabra)
+            if sug and sug != palabra:
+                sugerencias.append({"palabra": palabra, "sugerencia": sug})
+            else:
+                sugerencias.append({"palabra": palabra, "sugerencia": None})
 
-        if not errores:
-            resultados.append({"estado":"OK","detalle":"Sin errores ortográficos detectados"})
-        else:
-            resultados.append({"estado":"INFO","detalle":f"{len(errores)} posible(s) error(es) ortográfico(s)"})
-            for palabra in sorted(errores)[:20]:
-                sugerencia = spell.correction(palabra)
-                if sugerencia and sugerencia != palabra:
-                    resultados.append({"estado":"WARN","detalle":f'"{palabra}" → sugerencia: "{sugerencia}"'})
-                else:
-                    resultados.append({"estado":"WARN","detalle":f'"{palabra}" no reconocida en diccionario español'})
-
-    except TimeoutError:
-        resultados.append({"estado":"WARN","detalle":"Verificación ortográfica omitida (tiempo límite excedido)"})
     except Exception as e:
-        resultados.append({"estado":"WARN","detalle":f"Error en verificación ortográfica: {str(e)}"})
+        return {"titulo":"Ortografía","estado":"WARN","fragmento":[],
+                "validaciones":[{"estado":"WARN","detalle":f"Error: {str(e)}"}],
+                "tipo":"ortografia"}
 
-    return resultados
+    validaciones = []
+    if not sugerencias:
+        validaciones.append({"estado":"OK","detalle":"Sin errores ortográficos detectados"})
+    else:
+        validaciones.append({"estado":"INFO","detalle":f"{len(sugerencias)} posible(s) error(es) — solo sugerencias, verificar manualmente"})
 
+    return {
+        "titulo":       "Ortografía",
+        "estado":       "OK" if not sugerencias else "INFO",
+        "fragmento":    sugerencias,
+        "validaciones": validaciones,
+        "tipo":         "ortografia",
+    }
 
-# ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # ENDPOINT PRINCIPAL
-# ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────
 @app.route('/verificar', methods=['POST'])
 def verificar():
-    # ── Validar archivo
     if 'file' not in request.files:
         return jsonify({"error": "No se recibió ningún archivo"}), 400
 
     file = request.files['file']
-
-    if not file or not file.filename:
-        return jsonify({"error": "Archivo vacío"}), 400
-
-    if not allowed_file(file.filename):
+    if not file or not file.filename or not allowed_file(file.filename):
         return jsonify({"error": "Solo se aceptan archivos .docx"}), 400
 
-    # ── Leer en memoria (ZERO RETENTION — nunca toca disco)
     file_bytes = file.read()
     if len(file_bytes) == 0:
         return jsonify({"error": "El archivo está vacío"}), 400
 
-    # ── Parámetros
     titulo_p    = request.form.get('titulo', '').strip()
     id_tarea    = request.form.get('id_tarea', '').strip()
     consecutivo = request.form.get('consecutivo', '').strip()
 
-    # ── Procesar
     try:
         contenido = extraer_contenido(file_bytes)
     except Exception as e:
         return jsonify({"error": f"No se pudo leer el documento: {str(e)}"}), 422
 
-    resultados = {
-        "parametros": verificar_parametros(contenido, titulo_p, id_tarea, consecutivo),
-        "fechas":     verificar_fechas(contenido),
-        "autores":    verificar_autores(contenido),
-        "ortografia": verificar_ortografia(contenido),
-    }
+    secciones = [
+        seccion_encabezado(contenido, titulo_p),
+        seccion_info_documento(contenido, consecutivo),
+        seccion_historial(contenido, titulo_p),
+        seccion_conclusiones(contenido, titulo_p, id_tarea, consecutivo),
+        seccion_fechas(contenido),
+        verificar_ortografia(contenido),
+    ]
 
-    # ── Conteos resumen
-    total_ok   = sum(1 for rs in resultados.values() for r in rs if r["estado"] == "OK")
-    total_warn = sum(1 for rs in resultados.values() for r in rs if r["estado"] == "WARN")
-    total_err  = sum(1 for rs in resultados.values() for r in rs if r["estado"] == "ERROR")
+    total_ok   = sum(1 for s in secciones if s["estado"] == "OK")
+    total_warn = sum(1 for s in secciones if s["estado"] == "WARN")
+    total_err  = sum(1 for s in secciones if s["estado"] == "ERROR")
 
     return jsonify({
-        "resultados": resultados,
-        "resumen": {
-            "ok":      total_ok,
-            "alertas": total_warn,
-            "errores": total_err,
-        }
+        "secciones": secciones,
+        "resumen": {"ok": total_ok, "alertas": total_warn, "errores": total_err}
     })
-
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "service": "DocVerify · NTT Data"})
+    return jsonify({"status": "ok"})
 
-
-# ─────────────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────────────
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('FLASK_ENV') == 'development'
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    app.run(host='0.0.0.0', port=port, debug=False)
