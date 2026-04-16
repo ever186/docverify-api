@@ -4,46 +4,39 @@ app.py — Verificador de coherencia .docx
 import os, re, io, traceback, logging
 logging.basicConfig(level=logging.INFO)
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 from docx import Document
-from spellchecker import SpellChecker
 
 app = Flask(__name__)
-CORS(app, origins=["https://ever186.github.io"])
 app.config['MAX_CONTENT_LENGTH'] = 15 * 1024 * 1024
 
-# Pre-cargar spellchecker una sola vez al arrancar
-try:
-    SPELL = SpellChecker(language='es')
-except Exception:
-    SPELL = None
+# CORS manual — más robusto que flask-CORS, funciona en todos los casos
+CORS_ORIGIN = 'https://ever186.github.io'
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin']  = CORS_ORIGIN
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept'
+    response.headers['Access-Control-Max-Age']       = '600'
+    return response
+
+@app.errorhandler(400)
+@app.errorhandler(413)
+@app.errorhandler(422)
+@app.errorhandler(500)
+def error_handler(e):
+    resp = jsonify({'error': str(e)})
+    resp.status_code = getattr(e, 'code', 500)
+    resp.headers['Access-Control-Allow-Origin'] = CORS_ORIGIN
+    return resp
+
+# SpellChecker desactivado en producción — consume demasiado en Render free
+# Se puede activar en versión de pago o con más recursos
+SPELL = None
 
 ALLOWED = {'docx'}
 
-# CRÍTICO: flask-CORS no agrega headers en errores 500
-# Este after_request los fuerza en TODA respuesta incluyendo crashes
-@app.after_request
-def cors_always(response):
-    origin = request.headers.get('Origin', '')
-    response.headers['Access-Control-Allow-Origin']  = origin or '*'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-    return response
 
-# Capturar cualquier excepción no manejada y devolverla como JSON con CORS
-@app.errorhandler(500)
-def internal_error(e):
-    resp = jsonify({'error': f'Error interno del servidor: {str(e)}'})
-    resp.status_code = 500
-    resp.headers['Access-Control-Allow-Origin'] = '*'
-    return resp
-
-@app.errorhandler(Exception)
-def unhandled(e):
-    resp = jsonify({'error': f'Error inesperado: {str(e)}'})
-    resp.status_code = 500
-    resp.headers['Access-Control-Allow-Origin'] = '*'
-    return resp
 def allowed_file(f): return '.' in f and f.rsplit('.',1)[1].lower() in ALLOWED
 
 # ── HELPERS ──────────────────────────────────────────────────────────────
@@ -338,8 +331,8 @@ def es_hex(p): return bool(re.match(r'^[0-9a-f]{4,}$', p))
 
 def s_ortografia(c):
     if not SPELL:
-        return {'titulo':'Ortografía','estado':'WARN','fragmento':[],
-                'validaciones':[{'estado':'WARN','detalle':'Revisor ortográfico no disponible'}],'tipo':'ortografia'}
+        return {'titulo':'Ortografía','estado':'INFO','fragmento':[],
+                'validaciones':[{'estado':'INFO','detalle':'Revisión ortográfica disponible solo en versión local (verificador_test.py)'}],'tipo':'ortografia'}
 
     texto = re.sub(r'<[^>]+>',' ',c['texto'])
     texto = re.sub(r'https?://\S+',' ',texto)
