@@ -1,14 +1,15 @@
 """
 app.py — Verificador de coherencia .docx
 """
-import os, re, io
+import os, re, io, traceback, logging
+logging.basicConfig(level=logging.INFO)
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from docx import Document
 from spellchecker import SpellChecker
 
 app = Flask(__name__)
-CORS(app, origins=["*"])  # simple y funcional
+CORS(app, origins=["https://ever186.github.io"])
 app.config['MAX_CONTENT_LENGTH'] = 15 * 1024 * 1024
 
 # Pre-cargar spellchecker una sola vez al arrancar
@@ -18,6 +19,31 @@ except Exception:
     SPELL = None
 
 ALLOWED = {'docx'}
+
+# CRÍTICO: flask-CORS no agrega headers en errores 500
+# Este after_request los fuerza en TODA respuesta incluyendo crashes
+@app.after_request
+def cors_always(response):
+    origin = request.headers.get('Origin', '')
+    response.headers['Access-Control-Allow-Origin']  = origin or '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+# Capturar cualquier excepción no manejada y devolverla como JSON con CORS
+@app.errorhandler(500)
+def internal_error(e):
+    resp = jsonify({'error': f'Error interno del servidor: {str(e)}'})
+    resp.status_code = 500
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    return resp
+
+@app.errorhandler(Exception)
+def unhandled(e):
+    resp = jsonify({'error': f'Error inesperado: {str(e)}'})
+    resp.status_code = 500
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    return resp
 def allowed_file(f): return '.' in f and f.rsplit('.',1)[1].lower() in ALLOWED
 
 # ── HELPERS ──────────────────────────────────────────────────────────────
@@ -369,7 +395,11 @@ def verificar():
     try:
         c = extraer_contenido(fb)
     except Exception as e:
-        return jsonify({'error':f'No se pudo leer el documento: {str(e)}'}), 422
+        logging.error(f'extraer_contenido error: {traceback.format_exc()}')
+        resp = jsonify({'error':f'No se pudo leer el documento: {str(e)}'})
+        resp.status_code = 422
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        return resp
 
     secciones = []
     for fn, args, nombre in [
@@ -383,6 +413,7 @@ def verificar():
         try:
             secciones.append(fn(*args))
         except Exception as e:
+            logging.error(f'Sección {nombre} error: {traceback.format_exc()}')
             secciones.append({'titulo':nombre,'estado':'WARN','fragmento':[],
                               'validaciones':[{'estado':'WARN','detalle':f'Error: {str(e)}'}],'tipo':'error'})
 
