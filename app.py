@@ -7,7 +7,6 @@ import os
 import re
 import io
 import signal
-import threading
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -20,8 +19,16 @@ CORS(app,
     methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
     expose_headers=["Content-Type"],
-    max_age=600
+    max_age=600,
+    supports_credentials=False
 )
+
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin']  = 'https://ever186.github.io'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
 app.config['MAX_CONTENT_LENGTH'] = 15 * 1024 * 1024  # 15 MB
 
 @app.errorhandler(413)
@@ -578,28 +585,16 @@ def verificar_ortografia(contenido):
 
     sugerencias = []
     try:
-        resultado_spell = {"data": None, "done": False}
-        def run_spell():
-            try:
-                spell = SpellChecker(language='es')
-                desc  = spell.unknown(palabras_revisar)
-                errores = [p for p in desc if p not in IGNORAR_PALABRAS and not es_hex_o_id(p)]
-                resultado_spell["data"] = (spell, errores)
-            except Exception as ex:
-                resultado_spell["data"] = ex
-            finally:
-                resultado_spell["done"] = True
+        spell     = SpellChecker(language='es')
+        # Procesar en lotes pequeños para evitar timeouts
+        lote_size = 50
+        errores   = []
+        for i in range(0, min(len(palabras_revisar), 200), lote_size):
+            lote = palabras_revisar[i:i+lote_size]
+            desc = spell.unknown(lote)
+            errores += [p for p in desc if p not in IGNORAR_PALABRAS and not es_hex_o_id(p)]
 
-        t = threading.Thread(target=run_spell, daemon=True)
-        t.start()
-        t.join(timeout=12)
-
-        if not resultado_spell["done"] or isinstance(resultado_spell["data"], Exception):
-            return {"titulo":"Ortografía","estado":"WARN","fragmento":[],
-                    "validaciones":[{"estado":"WARN","detalle":"Revisión ortográfica omitida por timeout"}],
-                    "tipo":"ortografia"}
-
-        spell, errores = resultado_spell["data"]
+        errores = list(set(errores))
         for palabra in sorted(errores)[:25]:
             sug = spell.correction(palabra)
             if sug and sug != palabra:
@@ -609,14 +604,15 @@ def verificar_ortografia(contenido):
 
     except Exception as e:
         return {"titulo":"Ortografía","estado":"WARN","fragmento":[],
-                "validaciones":[{"estado":"WARN","detalle":f"Error: {str(e)}"}],
+                "validaciones":[{"estado":"WARN","detalle":f"Revisión ortográfica no disponible: {str(e)}"}],
                 "tipo":"ortografia"}
 
     validaciones = []
     if not sugerencias:
         validaciones.append({"estado":"OK","detalle":"Sin errores ortográficos detectados"})
     else:
-        validaciones.append({"estado":"INFO","detalle":f"{len(sugerencias)} posible(s) error(es) — solo sugerencias, verificar manualmente"})
+        validaciones.append({"estado":"INFO",
+                             "detalle":f"{len(sugerencias)} posible(s) error(es) — solo sugerencias, verificar manualmente"})
 
     return {
         "titulo":       "Ortografía",
@@ -625,6 +621,7 @@ def verificar_ortografia(contenido):
         "validaciones": validaciones,
         "tipo":         "ortografia",
     }
+
 
 # ─────────────────────────────────────────────
 # ENDPOINT PRINCIPAL
@@ -653,16 +650,29 @@ def verificar():
     try:
         contenido = extraer_contenido(file_bytes)
     except Exception as e:
-        return jsonify({"error": f"No se pudo leer el documento: {str(e)}"}), 422
+        resp = jsonify({"error": f"No se pudo leer el documento: {str(e)}"})
+        resp.status_code = 422
+        return resp
 
-    secciones = [
-        seccion_encabezado(contenido, titulo_p),
-        seccion_info_documento(contenido, consecutivo),
-        seccion_historial(contenido, titulo_p),
-        seccion_conclusiones(contenido, titulo_p, id_tarea, consecutivo),
-        seccion_fechas(contenido),
-        verificar_ortografia(contenido),
-    ]
+    secciones = []
+    for fn, args, nombre in [
+        (seccion_encabezado,    (contenido, titulo_p),                        'Encabezado'),
+        (seccion_info_documento,(contenido, consecutivo),                     'Información del documento'),
+        (seccion_historial,     (contenido, titulo_p),                        'Historial de revisiones'),
+        (seccion_conclusiones,  (contenido, titulo_p, id_tarea, consecutivo), 'Conclusiones'),
+        (seccion_fechas,        (contenido,),                                 'Coherencia de fechas'),
+        (verificar_ortografia,  (contenido,),                                 'Ortografía'),
+    ]:
+        try:
+            secciones.append(fn(*args))
+        except Exception as e:
+            secciones.append({
+                "titulo":       nombre,
+                "estado":       "WARN",
+                "fragmento":    [],
+                "validaciones": [{"estado":"WARN","detalle":f"Error procesando sección: {str(e)}"}],
+                "tipo":         "error"
+            })
 
     total_ok   = sum(1 for s in secciones if s["estado"] == "OK")
     total_warn = sum(1 for s in secciones if s["estado"] == "WARN")
